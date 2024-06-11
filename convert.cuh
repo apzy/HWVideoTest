@@ -21,4 +21,6 @@ namespace cuda_common
     cudaError_t setColorSpace2(float hue);
 
     cudaError_t CUDAToBGR(uint32* dataY, uint32* dataUV, size_t pitchY, size_t pitchUV, unsigned char* d_dstRGB, int width, int height);
+
+    cudaError_t convertInt32(unsigned char* src, uint32* dst, int width, int height);
 }

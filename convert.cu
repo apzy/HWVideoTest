@@ -1,5 +1,7 @@
 #include "convert.cuh"
 
+#define CUDA_THREAD_NUM 1024
+
 namespace cuda_common
 {
 
@@ -182,6 +184,27 @@ namespace cuda_common
 			return cudaStatus;
 		}
 
+		return cudaStatus;
+	}
+
+	extern "C" __global__ void CUDAconvertInt32(unsigned char* src, uint32 * dst, int width, int height)
+	{
+		int idx = blockIdx.x * CUDA_THREAD_NUM + CUDA_THREAD_NUM;
+		int r = *(src + idx * 3);
+		int g = *(src + idx * 3 + 1);
+		int b = *(src + idx * 3 + 2);
+		*(dst + idx) = 0xff000000 |
+			((((uint32)r) << 16) & 0xff0000) |
+			((((uint32)g) << 8) & 0xff00) |
+			((uint32)b);
+	}
+
+	cudaError_t convertInt32(unsigned char* src, uint32* dst, int width, int height)
+	{
+		int blockSize = width * height / CUDA_THREAD_NUM + 1;
+		CUDAconvertInt32 << <blockSize, CUDA_THREAD_NUM >> > (src,dst,width,height);
+		cudaError_t cudaStatus = cudaGetLastError();
+		cudaStatus = cudaDeviceSynchronize();
 		return cudaStatus;
 	}
 }

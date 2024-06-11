@@ -24,6 +24,9 @@ static FILE* output_file = NULL;
 unsigned char* pHwRgb = nullptr;
 
 cv::Mat frameMat(cv::Size(1080, 1920), CV_8UC3);
+
+uint32* pSrcInt32Data = nullptr;
+
 static int hw_decoder_init(AVCodecContext* ctx, const enum AVHWDeviceType type)
 {
 	int err = 0;
@@ -97,15 +100,16 @@ static int decode_write(AVCodecContext* avctx, AVPacket* packet)
 			if (pHwRgb == nullptr)
 			{
 				cudaStatus = cudaMalloc((void**)&pHwRgb, 3 * frame->width * frame->height * sizeof(unsigned char));
+				cudaStatus = cudaMalloc((void**)&pSrcInt32Data, frame->width * frame->height * sizeof(uint32));
 			}
 			cudaStatus = cuda_common::CUDAToBGR((uint32*)frame->data[0], (uint32*)frame->data[1], frame->linesize[0], frame->linesize[1], pHwRgb, frame->width, frame->height);
-			cudaDeviceSynchronize();
 			if (cudaStatus != cudaSuccess)
 			{
 				std::cout << "CUDAToBGR failed !!!" << std::endl;
 				return 0;
 			}
-			cudaStatus = cudaMemcpy(frameMat.data, pHwRgb, 3 * frame->width * frame->height * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+			cuda_common::convertInt32(pHwRgb, pSrcInt32Data, frame->width, frame->height);
+			//cudaStatus = cudaMemcpy(frameMat.data, pHwRgb, 3 * frame->width * frame->height * sizeof(unsigned char), cudaMemcpyDeviceToHost);
 			/* retrieve data from GPU to CPU */
 			//if ((ret = av_hwframe_transfer_data(sw_frame, frame, 0)) < 0)
 			//{

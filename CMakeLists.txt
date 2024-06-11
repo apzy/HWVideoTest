@@ -5,7 +5,7 @@ project(HWVideoTest LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-set(OpenCV_DIR D:/source/opencv_build/opencv/build/install)
+set(OpenCV_DIR D:/source/opencv_build/opencv/build_gpu/install)
 find_package(OpenCV 4 REQUIRED)
 
 add_executable(HWVideoTest "main.cpp" "convert.cuh" "convert.cu")
