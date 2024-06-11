@@ -1,6 +1,7 @@
 #include <chrono>
 #include <opencv2/opencv.hpp>
 #include <stdio.h>
+#include "convert.cuh"
 
 extern "C"
 {
@@ -20,6 +21,9 @@ static AVBufferRef* hw_device_ctx = NULL;
 static enum AVPixelFormat hw_pix_fmt;
 static FILE* output_file = NULL;
 
+unsigned char* pHwRgb = nullptr;
+
+cv::Mat frameMat(cv::Size(1080, 1920), CV_8UC3);
 static int hw_decoder_init(AVCodecContext* ctx, const enum AVHWDeviceType type)
 {
 	int err = 0;
@@ -88,25 +92,39 @@ static int decode_write(AVCodecContext* avctx, AVPacket* packet)
 
 		if (frame->format == hw_pix_fmt)
 		{
-			/* retrieve data from GPU to CPU */
-			if ((ret = av_hwframe_transfer_data(sw_frame, frame, 0)) < 0)
+
+			cudaError_t cudaStatus;
+			if (pHwRgb == nullptr)
 			{
-				fprintf(stderr, "Error transferring the data to system memory\n");
-				goto fail;
+				cudaStatus = cudaMalloc((void**)&pHwRgb, 3 * frame->width * frame->height * sizeof(unsigned char));
 			}
-			tmp_frame = sw_frame;
+			cudaStatus = cuda_common::CUDAToBGR((uint32*)frame->data[0], (uint32*)frame->data[1], frame->linesize[0], frame->linesize[1], pHwRgb, frame->width, frame->height);
+			cudaDeviceSynchronize();
+			if (cudaStatus != cudaSuccess)
+			{
+				std::cout << "CUDAToBGR failed !!!" << std::endl;
+				return 0;
+			}
+			cudaStatus = cudaMemcpy(frameMat.data, pHwRgb, 3 * frame->width * frame->height * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+			/* retrieve data from GPU to CPU */
+			//if ((ret = av_hwframe_transfer_data(sw_frame, frame, 0)) < 0)
+			//{
+			//	fprintf(stderr, "Error transferring the data to system memory\n");
+			//	goto fail;
+			//}
+			//tmp_frame = sw_frame;
 		}
 		else
 		{
-			tmp_frame = frame;
+			//tmp_frame = frame;
 		}
 
-		printf("tmp frame fmt ; %s\n", av_get_pix_fmt_name((AVPixelFormat)tmp_frame->format));
+		//printf("tmp frame fmt ; %s\n", av_get_pix_fmt_name((AVPixelFormat)tmp_frame->format));
 
 		{
 			auto endTime = std::chrono::high_resolution_clock::now();
-			auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-			std::cout << "create Elapsed time: " << elapsedTime.count() << "s\n";
+			auto elapsedTime = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+			std::cout << "create Elapsed time: " << elapsedTime.count() << "mis\n";
 		}
 
 	fail:
@@ -120,6 +138,8 @@ static int decode_write(AVCodecContext* avctx, AVPacket* packet)
 
 int main(int argc, char* argv[])
 {
+	cuda_common::setColorSpace2(0);
+
 	AVFormatContext* input_ctx = NULL;
 	int video_stream, ret;
 	AVStream* video = NULL;
