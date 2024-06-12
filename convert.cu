@@ -324,26 +324,26 @@ namespace cuda_common
 		int x = blockIdx.x * blockDim.x + threadIdx.x;
 		int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-		if (x < width && y < height)
+		if (x >= width || y >= height) return;
+
+		int rgbIndex = (y * width + x) * 3;
+		int yIndex = y * width + x;
+		int uvIndex = (y / 2) * (width / 2) + (x / 2);
+
+		unsigned char r = rgb[rgbIndex];
+		unsigned char g = rgb[rgbIndex + 1];
+		unsigned char b = rgb[rgbIndex + 2];
+
+		unsigned char Y = (unsigned char)(0.299f * r + 0.587f * g + 0.114f * b);
+		unsigned char U = (unsigned char)(-0.14713f * r - 0.28886f * g + 0.436f * b + 128);
+		unsigned char V = (unsigned char)(0.615f * r - 0.51499f * g - 0.10001f * b + 128);
+
+		yuv[yIndex] = Y;
+
+		if ((x % 2 == 0) && (y % 2 == 0))
 		{
-			int rgb_index = (y * width + x) * 3;
-			float r = rgb[rgb_index];
-			float g = rgb[rgb_index + 1];
-			float b = rgb[rgb_index + 2];
-
-			float y_val = Y_COEF_R * r + Y_COEF_G * g + Y_COEF_B * b;
-			yuv[(y * width + x)] = static_cast<unsigned char>(y_val);
-
-			if ((x % 2 == 0) && (y % 2 == 0))
-			{   
-				float u_val = U_COEF_R * r + U_COEF_G * g + U_COEF_B * b + 128; // 加128是为了将色度分量范围移到[0, 255]  
-				float v_val = V_COEF_R * r + V_COEF_G * g + V_COEF_B * b + 128;
-
-				int uv_width = width / 2;
-				int uv_index = ((y / 2) * uv_width + (x / 2)) * 2;
-				yuv[width * height + uv_index] = static_cast<unsigned char>(u_val);
-				yuv[width * height + uv_index + 1] = static_cast<unsigned char>(v_val);
-			}
+			yuv[width * height + uvIndex] = U;
+			yuv[width * height + (width * height / 4) + uvIndex] = V;
 		}
 	}
 

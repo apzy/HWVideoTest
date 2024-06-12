@@ -33,6 +33,16 @@ uint32* pDstInt32Data = nullptr;
 
 unsigned char* dstyuvData = nullptr;
 
+int video_stream, ret;
+const char* outputFile, * codecName;
+const AVCodec* encoderCodec;
+AVCodecContext* encoderCtx = NULL;
+AVPacket* encoderPkt;
+FILE* f;
+
+AVFrame* outputFrame;
+
+
 static int hw_decoder_init(AVCodecContext* ctx, const enum AVHWDeviceType type)
 {
 	int err = 0;
@@ -142,8 +152,7 @@ static int decode_write(AVCodecContext* avctx, AVPacket* packet)
 				cudaStatus = cudaMalloc((void**)&pDstInt32Data, dstWith * dstHeight * sizeof(uint32));
 				cudaStatus = cudaMalloc((void**)&dstyuvData, dstWith * dstHeight * sizeof(unsigned char) * 1.5);
 			}
-			printf("%d %d %d\n", frame->data[1] - frame->data[0],frame->linesize[0], frame->linesize[1]);
-			cudaStatus = cuda_common::CUDAToBGR((uint32*)frame->data[0], (uint32*)frame->data[1], frame->linesize[0], 
+			cudaStatus = cuda_common::CUDAToBGR((uint32*)frame->data[0], (uint32*)frame->data[1], frame->linesize[0],
 				frame->linesize[1], pHwRgb, frame->width, frame->height);
 			if (cudaStatus != cudaSuccess)
 			{
@@ -155,11 +164,19 @@ static int decode_write(AVCodecContext* avctx, AVPacket* packet)
 			cuda_common::convertInt32toRgb(pDstInt32Data, pHwDstRgb, dstWith, dstHeight);
 			cuda_common::rgb2yuv420p(pHwDstRgb, dstyuvData, dstWith, dstHeight);
 
+			cudaMemcpy(outputFrame->data[0], dstyuvData, 1.5 * dstWith * dstHeight * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+
+			//cv::Mat rgbMat(cv::Size(dstWith ,dstHeight),CV_8UC3);
+			//cudaMemcpy(rgbMat.data, pHwDstRgb, 3 * dstWith * dstHeight * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+			//cv::imshow("ori", rgbMat);
+			//cv::waitKey(1);
+
 			//cv::Mat resizedMat(dstHeight + dstHeight / 2, dstWith, CV_8UC1);
-			//printf("%d %d\n", resizedMat.cols, resizedMat.rows);
 			//cudaMemcpy(resizedMat.data, dstyuvData, 1.5 * dstWith * dstHeight * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+			//cv::imshow("out", resizedMat);
+			//printf("%d %d\n", resizedMat.cols, resizedMat.rows);
 			//cv::Mat rgbDst;
-			//cv::cvtColor(resizedMat, rgbDst, cv::COLOR_YUV2BGR_YV12,3);
+			//cv::cvtColor(resizedMat, rgbDst, cv::COLOR_YUV420p2BGR,3);
 			//cv::imshow("out", rgbDst);
 			//cv::waitKey(1);
 			//cudaStatus = cudaMemcpy(frameMat.data, pHwRgb, 3 * frame->width * frame->height * sizeof(unsigned char), cudaMemcpyDeviceToHost);
@@ -197,11 +214,6 @@ int main(int argc, char* argv[])
 {
 	cuda_common::setColorSpace2(0);
 
-	int video_stream, ret;
-	const char* outputFile, * codecName;
-	const AVCodec* encoderCodec;
-	AVCodecContext* encoderCtx = NULL;
-	AVPacket* encoderPkt;
 
 	uint8_t endcode[] = { 0, 0, 1, 0xb7 };
 	outputFile = "output.mp4";
@@ -226,11 +238,11 @@ int main(int argc, char* argv[])
 	encoderCtx->bit_rate = 400000;
 	encoderCtx->width = dstWith;
 	encoderCtx->height = dstHeight;
-	encoderCtx->time_base = {1,25};
-	encoderCtx->framerate = {25,1};
+	encoderCtx->time_base = { 1,25 };
+	encoderCtx->framerate = { 25,1 };
 	encoderCtx->gop_size = 10;
 	encoderCtx->max_b_frames = 1;
-	encoderCtx->pix_fmt = AV_PIX_FMT_NV12;
+	encoderCtx->pix_fmt = AV_PIX_FMT_YUV420P;
 
 	if (encoderCodec->id == AV_CODEC_ID_H264)
 		av_opt_set(encoderCtx->priv_data, "preset", "slow", 0);
@@ -242,6 +254,15 @@ int main(int argc, char* argv[])
 		fprintf(stderr, "Could not open codec: %d\n", ret);
 		exit(1);
 	}
+
+	f = fopen(outputFile, "wb");
+
+	outputFrame = av_frame_alloc();
+	outputFrame->format = AV_PIX_FMT_YUV420P;
+	outputFrame->width = dstWith;
+	outputFrame->height = dstHeight;
+
+	av_frame_get_buffer(outputFrame, 0);
 
 	AVFormatContext* input_ctx = NULL;
 	AVStream* video = NULL;
