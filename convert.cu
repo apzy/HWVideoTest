@@ -7,6 +7,16 @@
 #define WARP_SIZE 32
 #define elemsPerThread 1
 
+#define Y_COEF_R 0.299f  
+#define Y_COEF_G 0.587f  
+#define Y_COEF_B 0.114f  
+#define U_COEF_R -0.14713f  
+#define U_COEF_G -0.28886f  
+#define U_COEF_B 0.436f  
+#define V_COEF_R 0.615f  
+#define V_COEF_G -0.51498f  
+#define V_COEF_B -0.10001f  
+
 namespace cuda_common
 {
 
@@ -212,12 +222,12 @@ namespace cuda_common
 		int r = data & 0xff;
 		int g = (data >> 8) & 0xff;
 		int b = (data >> 16) & 0xff;
-		*(dst + idx * 3) = r;
+		*(dst + idx * 3) = b;
 		*(dst + idx * 3 + 1) = g;
-		*(dst + idx * 3 + 2) = b;
+		*(dst + idx * 3 + 2) = r;
 	}
 
-	extern "C" __global__ void SomeKernel(uint32* originalImage, uint32* resizedImage, int w, int h, int w2, int h2)
+	extern "C" __global__ void SomeKernel(uint32 * originalImage, uint32 * resizedImage, int w, int h, int w2, int h2)
 	{
 		__shared__ uint32 tile[1024];
 		const float x_ratio = ((float)(w - 1)) / w2;
@@ -269,6 +279,93 @@ namespace cuda_common
 		threadId = blockIdx.x * threadNum * elemsPerThread + threadIdx.x * elemsPerThread;
 		resizedImage[threadId] = tile[threadIdx.x];
 
+	}
+
+	extern "C" __global__ void rgb_to_nv12_kernel(unsigned char* rgb, unsigned char* nv12, int width, int height)
+	{
+		int x = threadIdx.x + blockIdx.x * blockDim.x;
+		int y = threadIdx.y + blockIdx.y * blockDim.y;
+
+		if (x < width && y < height)
+		{
+			int rgb_index = (y * width + x) * 3;
+			int y_index = y * width + x;
+			int uv_index = width * height + (y / 2) * width + x;
+
+			// 提取RGB值  
+			unsigned char r = rgb[rgb_index];
+			unsigned char g = rgb[rgb_index + 1];
+			unsigned char b = rgb[rgb_index + 2];
+
+			//printf("%d %d %d\n", r, g, b);
+
+			// 转换到YUV  
+			float y_val = 0.299f * r + 0.587f * g + 0.114f * b;
+			float u_val = -0.169f * r - 0.331f * g + 0.5f * b + 128.0f;
+			float v_val = 0.5f * r - 0.419f * g - 0.081f * b + 128.0f;
+
+			// 存储Y分量  
+			nv12[y_index] = static_cast<unsigned char>(y_val);
+
+			// 对于UV分量，需要处理交织存储，且每两个像素共享一对UV值  
+			if (y % 2 == 0 && x < width)
+			{
+				nv12[uv_index] = static_cast<unsigned char>(u_val);
+				if (x + 1 < width)
+				{ // 防止越界  
+					nv12[uv_index + 1] = static_cast<unsigned char>(v_val);
+				}
+			}
+		}
+	}
+
+	extern "C" __global__ void rgb_to_yuv420p(unsigned char* rgb, unsigned char* yuv, int width, int height)
+	{
+		int x = blockIdx.x * blockDim.x + threadIdx.x;
+		int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+		if (x < width && y < height)
+		{
+			int rgb_index = (y * width + x) * 3;
+			float r = rgb[rgb_index];
+			float g = rgb[rgb_index + 1];
+			float b = rgb[rgb_index + 2];
+
+			float y_val = Y_COEF_R * r + Y_COEF_G * g + Y_COEF_B * b;
+			yuv[(y * width + x)] = static_cast<unsigned char>(y_val);
+
+			if ((x % 2 == 0) && (y % 2 == 0))
+			{   
+				float u_val = U_COEF_R * r + U_COEF_G * g + U_COEF_B * b + 128; // 加128是为了将色度分量范围移到[0, 255]  
+				float v_val = V_COEF_R * r + V_COEF_G * g + V_COEF_B * b + 128;
+
+				int uv_width = width / 2;
+				int uv_index = ((y / 2) * uv_width + (x / 2)) * 2;
+				yuv[width * height + uv_index] = static_cast<unsigned char>(u_val);
+				yuv[width * height + uv_index + 1] = static_cast<unsigned char>(v_val);
+			}
+		}
+	}
+
+	cudaError_t rgb2yuv420p(unsigned char* rgb, unsigned char* yuv, int width, int height)
+	{
+		dim3 blockSize(32, 32); // 可以根据GPU架构调整  
+		dim3 gridSize((width + blockSize.x - 1) / blockSize.x, (height + blockSize.y - 1) / blockSize.y);
+		rgb_to_yuv420p << <gridSize, blockSize >> > (rgb, yuv, width, height);
+
+		cudaError_t cudaStatus = cudaGetLastError();
+		cudaStatus = cudaDeviceSynchronize();
+		return cudaStatus;
+	}
+
+	cudaError_t rgb2nv12(unsigned char* rgb, unsigned char* nv12, int width, int height)
+	{
+		dim3 blockSize(32,32); // 可以根据GPU架构调整  
+		dim3 gridSize((width + blockSize.x - 1) / blockSize.x, (height + blockSize.y - 1) / blockSize.y);
+		rgb_to_nv12_kernel << <gridSize, blockSize >> > (rgb, nv12, width, height);
+		cudaError_t cudaStatus = cudaGetLastError();
+		cudaStatus = cudaDeviceSynchronize();
+		return cudaStatus;
 	}
 
 	cudaError_t convertInt32(unsigned char* src, uint32* dst, int width, int height)

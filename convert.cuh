@@ -28,4 +28,8 @@ namespace cuda_common
     cudaError_t convertInt32toRgb(uint32* src, unsigned char* dst, int width, int height);
 
     cudaError_t resize(uint32* src, uint32* dst, int srcW, int srcH, int dstW, int dstH);
+
+    cudaError_t rgb2nv12(unsigned char* rgb, unsigned char* nv12, int width, int height);
+
+    cudaError_t rgb2yuv420p(unsigned char* rgb, unsigned char* yuv, int width, int height);
 }
