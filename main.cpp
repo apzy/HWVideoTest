@@ -22,10 +22,12 @@ static enum AVPixelFormat hw_pix_fmt;
 static FILE* output_file = NULL;
 
 unsigned char* pHwRgb = nullptr;
+unsigned char* pHwDstRgb = nullptr;
 
 cv::Mat frameMat(cv::Size(1080, 1920), CV_8UC3);
 
 uint32* pSrcInt32Data = nullptr;
+uint32* pDstInt32Data = nullptr;
 
 static int hw_decoder_init(AVCodecContext* ctx, const enum AVHWDeviceType type)
 {
@@ -95,12 +97,14 @@ static int decode_write(AVCodecContext* avctx, AVPacket* packet)
 
 		if (frame->format == hw_pix_fmt)
 		{
-
+			int dstWith = 1080, dstHeight = 1080;
 			cudaError_t cudaStatus;
 			if (pHwRgb == nullptr)
 			{
 				cudaStatus = cudaMalloc((void**)&pHwRgb, 3 * frame->width * frame->height * sizeof(unsigned char));
+				cudaStatus = cudaMalloc((void**)&pHwDstRgb, 3 * dstWith * dstHeight * sizeof(unsigned char));
 				cudaStatus = cudaMalloc((void**)&pSrcInt32Data, frame->width * frame->height * sizeof(uint32));
+				cudaStatus = cudaMalloc((void**)&pDstInt32Data, dstWith * dstHeight * sizeof(uint32));
 			}
 			cudaStatus = cuda_common::CUDAToBGR((uint32*)frame->data[0], (uint32*)frame->data[1], frame->linesize[0], frame->linesize[1], pHwRgb, frame->width, frame->height);
 			if (cudaStatus != cudaSuccess)
@@ -109,6 +113,12 @@ static int decode_write(AVCodecContext* avctx, AVPacket* packet)
 				return 0;
 			}
 			cuda_common::convertInt32(pHwRgb, pSrcInt32Data, frame->width, frame->height);
+			cuda_common::resize(pSrcInt32Data, pDstInt32Data, frame->width, frame->height, dstWith, dstHeight);
+			cuda_common::convertInt32toRgb(pDstInt32Data, pHwDstRgb, dstWith, dstHeight);
+			cv::Mat resizedMat(cv::Size(dstWith, dstHeight), CV_8UC3);
+			//cudaMemcpy(resizedMat.data, pHwDstRgb, 3 * dstWith * dstHeight * sizeof(unsigned char), cudaMemcpyDeviceToHost);
+			//cv::imshow("out", resizedMat);
+			//cv::waitKey(1);
 			//cudaStatus = cudaMemcpy(frameMat.data, pHwRgb, 3 * frame->width * frame->height * sizeof(unsigned char), cudaMemcpyDeviceToHost);
 			/* retrieve data from GPU to CPU */
 			//if ((ret = av_hwframe_transfer_data(sw_frame, frame, 0)) < 0)

@@ -2,6 +2,11 @@
 
 #define CUDA_THREAD_NUM 1024
 
+#define BLOCK_DIM 32
+#define threadNum 1024
+#define WARP_SIZE 32
+#define elemsPerThread 1
+
 namespace cuda_common
 {
 
@@ -189,7 +194,7 @@ namespace cuda_common
 
 	extern "C" __global__ void CUDAconvertInt32(unsigned char* src, uint32 * dst, int width, int height)
 	{
-		int idx = blockIdx.x * CUDA_THREAD_NUM + CUDA_THREAD_NUM;
+		int idx = blockIdx.x * CUDA_THREAD_NUM + threadIdx.x;
 		int r = *(src + idx * 3);
 		int g = *(src + idx * 3 + 1);
 		int b = *(src + idx * 3 + 2);
@@ -199,12 +204,98 @@ namespace cuda_common
 			((uint32)b);
 	}
 
+
+	extern "C" __global__ void CUDAconvertInt32toRgb(uint32 * src, unsigned char* dst, int width, int height)
+	{
+		int idx = blockIdx.x * CUDA_THREAD_NUM + threadIdx.x;
+		uint32 data = *(src + idx);
+		int r = data & 0xff;
+		int g = (data >> 8) & 0xff;
+		int b = (data >> 16) & 0xff;
+		*(dst + idx * 3) = r;
+		*(dst + idx * 3 + 1) = g;
+		*(dst + idx * 3 + 2) = b;
+	}
+
+	extern "C" __global__ void SomeKernel(uint32* originalImage, uint32* resizedImage, int w, int h, int w2, int h2)
+	{
+		__shared__ uint32 tile[1024];
+		const float x_ratio = ((float)(w - 1)) / w2;
+		const float y_ratio = ((float)(h - 1)) / h2;
+		unsigned int threadId = blockIdx.x * threadNum * elemsPerThread + threadIdx.x * elemsPerThread;
+		unsigned int shift = 0;
+		while ((threadId < w2 * h2 && shift < elemsPerThread))
+		{
+			const uint32 i = threadId / w2;
+			const uint32 j = threadId - (i * w2);
+			//float x_diff, y_diff, blue, red, green;
+
+			const uint32 x = (int)(x_ratio * j);
+			const uint32 y = (int)(y_ratio * i);
+			const float x_diff = (x_ratio * j) - x;
+			const float y_diff = (y_ratio * i) - y;
+			const uint32 index = (y * w + x);
+			const uint32 a = originalImage[index];
+			const uint32 b = originalImage[index + 1];
+			const uint32 c = originalImage[index + w];
+			const uint32 d = originalImage[index + w + 1];
+			// blue element
+			const float blue = (a & 0xff) * (1 - x_diff) * (1 - y_diff) + (b & 0xff) * (x_diff) * (1 - y_diff) +
+				(c & 0xff) * (y_diff) * (1 - x_diff) + (d & 0xff) * (x_diff * y_diff);
+
+			// green element
+			const float green = ((a >> 8) & 0xff) * (1 - x_diff) * (1 - y_diff) + ((b >> 8) & 0xff) * (x_diff) * (1 - y_diff) +
+				((c >> 8) & 0xff) * (y_diff) * (1 - x_diff) + ((d >> 8) & 0xff) * (x_diff * y_diff);
+
+			// red element
+			const float red = ((a >> 16) & 0xff) * (1 - x_diff) * (1 - y_diff) + ((b >> 16) & 0xff) * (x_diff) * (1 - y_diff) +
+				((c >> 16) & 0xff) * (y_diff) * (1 - x_diff) + ((d >> 16) & 0xff) * (x_diff * y_diff);
+
+
+			tile[threadIdx.x] =
+				0xff000000 |
+				((((uint32)red) << 16) & 0xff0000) |
+				((((uint32)green) << 8) & 0xff00) |
+				((uint32)blue);
+
+			//printf("%x %d %d %d\n", a, b, c, d);
+
+			threadId++;
+			//threadId+= WARP_SIZE;
+			shift++;
+		}
+
+		__syncthreads();
+		threadId = blockIdx.x * threadNum * elemsPerThread + threadIdx.x * elemsPerThread;
+		resizedImage[threadId] = tile[threadIdx.x];
+
+	}
+
 	cudaError_t convertInt32(unsigned char* src, uint32* dst, int width, int height)
 	{
 		int blockSize = width * height / CUDA_THREAD_NUM + 1;
-		CUDAconvertInt32 << <blockSize, CUDA_THREAD_NUM >> > (src,dst,width,height);
+		CUDAconvertInt32 << <blockSize, CUDA_THREAD_NUM >> > (src, dst, width, height);
 		cudaError_t cudaStatus = cudaGetLastError();
 		cudaStatus = cudaDeviceSynchronize();
 		return cudaStatus;
+	}
+
+	cudaError_t convertInt32toRgb(uint32* src, unsigned char* dst, int width, int height)
+	{
+		int blockSize = width * height / CUDA_THREAD_NUM + 1;
+		CUDAconvertInt32toRgb << <blockSize, CUDA_THREAD_NUM >> > (src, dst, width, height);
+		cudaError_t cudaStatus = cudaGetLastError();
+		cudaStatus = cudaDeviceSynchronize();
+		return cudaError_t();
+	}
+
+
+	cudaError_t resize(uint32* src, uint32* dst, int srcW, int srcH, int dstW, int dstH)
+	{
+		dim3 threads = dim3(threadNum, 1, 1); //block size 32,32,x
+		dim3 blocks = dim3(dstW * dstH / threadNum * elemsPerThread, 1, 1);
+		SomeKernel << <blocks, threads >> > (src, dst, srcW, srcH, dstW, dstH);
+		cudaDeviceSynchronize();
+		return cudaError_t();
 	}
 }
