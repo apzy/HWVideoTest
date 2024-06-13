@@ -2,392 +2,156 @@
 #include <opencv2/opencv.hpp>
 #include <stdio.h>
 #include "convert.cuh"
+#include <cuda.h>
+#include <iostream>
+#include <algorithm>
+#include <memory>
+#include "NvCodec/NvDecoder/NvDecoder.h"
+#include "Utils/FFmpegDemuxer.h"
+#include "Utils/ColorSpace.h"
+#include "Common/AppDecUtils.h"
+#include <chrono>
 
-extern "C"
+simplelogger::Logger* logger = simplelogger::LoggerFactory::CreateConsoleLogger();
+
+/**
+*   @brief  Function to copy image data from CUDA device pointer to host buffer
+*   @param  dpSrc   - CUDA device pointer which holds decoded raw frame
+*   @param  pDst    - Pointer to host buffer which acts as the destination for the copy
+*   @param  nWidth  - Width of decoded frame
+*   @param  nHeight - Height of decoded frame
+*/
+void GetImage(CUdeviceptr dpSrc, uint8_t* pDst, int nWidth, int nHeight)
 {
-#include <libavcodec/avcodec.h>
-#include <libavfilter/avfilter.h>
-#include <libavformat/avformat.h>
-#include <libavutil/avassert.h>
-#include <libavutil/hwcontext.h>
-#include <libavutil/imgutils.h>
-#include <libavutil/mem.h>
-#include <libavutil/opt.h>
-#include <libavutil/pixdesc.h>
-#include <libswscale/swscale.h>
+	CUDA_MEMCPY2D m = { 0 };
+	m.WidthInBytes = nWidth;
+	m.Height = nHeight;
+	m.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+	m.srcDevice = (CUdeviceptr)dpSrc;
+	m.srcPitch = m.WidthInBytes;
+	m.dstMemoryType = CU_MEMORYTYPE_HOST;
+	m.dstDevice = (CUdeviceptr)(m.dstHost = pDst);
+	m.dstPitch = m.WidthInBytes;
+	cuMemcpy2D(&m);
 }
 
-static AVBufferRef* hw_device_ctx = NULL;
-static enum AVPixelFormat hw_pix_fmt;
-static FILE* output_file = NULL;
-
-int dstWith = 1080, dstHeight = 1920;
-
-unsigned char* pHwRgb = nullptr;
-unsigned char* pHwDstRgb = nullptr;
-
-cv::Mat frameMat(cv::Size(1080, 1920), CV_8UC3);
-
-uint32* pSrcInt32Data = nullptr;
-uint32* pDstInt32Data = nullptr;
-
-unsigned char* dstyuvData = nullptr;
-
-int video_stream, ret;
-const char* outputFile, * codecName;
-const AVCodec* encoderCodec;
-AVCodecContext* encoderCtx = NULL;
-AVPacket* encoderPkt;
-FILE* f;
-
-AVFrame* outputFrame;
-
-
-static int hw_decoder_init(AVCodecContext* ctx, const enum AVHWDeviceType type)
+enum OutputFormat
 {
-	int err = 0;
+	native = 0, bgrp, rgbp, bgra, rgba, bgra64, rgba64
+};
 
-	if ((err = av_hwdevice_ctx_create(&hw_device_ctx, type, NULL, NULL, 0)) < 0)
+std::vector<std::string> vstrOutputFormatName =
+{
+	"native", "bgrp", "rgbp", "bgra", "rgba", "bgra64", "rgba64"
+};
+
+std::string GetSupportedFormats()
+{
+	std::ostringstream oss;
+	for (auto& v : vstrOutputFormatName)
 	{
-		fprintf(stderr, "Failed to create specified HW device.\n");
-		return err;
+		oss << " " << v;
 	}
-	ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
 
-	return err;
+	return oss.str();
 }
 
-static void encode(AVCodecContext* enc_ctx, AVFrame* frame, AVPacket* pkt, FILE* outfile)
+int main(int argc, char** argv)
 {
-	int ret;
+	char szInFilePath[256] = "input.mp4", szOutFilePath[256] = "output.mp4";
+	OutputFormat eOutputFormat = bgra;
+	int iGpu = 0;
+	bool bReturn = 1;
+	CUdeviceptr pTmpImage = 0;
 
-	/* send the frame to the encoder */
-	if (frame)
-		printf("Send frame %3d\n", frame->pts);
-
-	ret = avcodec_send_frame(enc_ctx, frame);
-	if (ret < 0)
+	try
 	{
-		fprintf(stderr, "Error sending a frame for encoding\n");
-		exit(1);
-	}
+		CheckInputFile(szInFilePath);
 
-	while (ret >= 0)
-	{
-		ret = avcodec_receive_packet(enc_ctx, pkt);
-		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
-			return;
-		else if (ret < 0)
+		if (!*szOutFilePath)
 		{
-			fprintf(stderr, "Error during encoding\n");
-			exit(1);
+			sprintf(szOutFilePath, "out.%s", vstrOutputFormatName[eOutputFormat].c_str());
 		}
 
-		printf("Write packet %3d (size=%5d)\n", pkt->pts, pkt->size);
-		fwrite(pkt->data, 1, pkt->size, outfile);
-		av_packet_unref(pkt);
-	}
-}
-
-static enum AVPixelFormat get_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts)
-{
-	const enum AVPixelFormat* p;
-
-	for (p = pix_fmts; *p != -1; p++)
-	{
-		if (*p == hw_pix_fmt)
-			return *p;
-	}
-
-	fprintf(stderr, "Failed to get HW surface format.\n");
-	return AV_PIX_FMT_NONE;
-}
-
-static int decode_write(AVCodecContext* avctx, AVPacket* packet)
-{
-	AVFrame* frame = NULL, * sw_frame = NULL;
-	AVFrame* tmp_frame = NULL;
-	uint8_t* buffer = NULL;
-	int size;
-	int ret = 0;
-
-	ret = avcodec_send_packet(avctx, packet);
-	if (ret < 0)
-	{
-		fprintf(stderr, "Error during decoding\n");
-		return ret;
-	}
-
-	while (1)
-	{
-		auto startTime = std::chrono::high_resolution_clock::now();
-		if (!(frame = av_frame_alloc()) || !(sw_frame = av_frame_alloc()))
+		std::ofstream fpOut(szOutFilePath, std::ios::out | std::ios::binary);
+		if (!fpOut)
 		{
-			fprintf(stderr, "Can not alloc frame\n");
-			ret = AVERROR(ENOMEM);
-			goto fail;
+			std::ostringstream err;
+			err << "Unable to open output file: " << szOutFilePath << std::endl;
+			throw std::invalid_argument(err.str());
 		}
 
-		ret = avcodec_receive_frame(avctx, frame);
-		if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+		ck(cuInit(0));
+		int nGpu = 0;
+		ck(cuDeviceGetCount(&nGpu));
+		if (iGpu < 0 || iGpu >= nGpu)
 		{
-			av_frame_free(&frame);
-			av_frame_free(&sw_frame);
-			return 0;
-		}
-		else if (ret < 0)
-		{
-			fprintf(stderr, "Error while decoding\n");
-			goto fail;
+			std::ostringstream err;
+			err << "GPU ordinal out of range. Should be within [" << 0 << ", " << nGpu - 1 << "]";
+			throw std::invalid_argument(err.str());
 		}
 
-		if (frame->format == hw_pix_fmt)
+		CUcontext cuContext = NULL;
+		createCudaContext(&cuContext, iGpu, 0);
+
+		FFmpegDemuxer demuxer(szInFilePath);
+		NvDecoder dec(cuContext, true, FFmpeg2NvCodecId(demuxer.GetVideoCodec()));
+		int nWidth = 0, nHeight = 0, nFrameSize = 0;
+		int anSize[] = { 0, 3, 3, 4, 4, 8, 8 };
+		std::unique_ptr<uint8_t[]> pImage;
+
+		int nVideoBytes = 0, nFrameReturned = 0, nFrame = 0, iMatrix = 0;
+		uint8_t* pVideo = nullptr;
+		uint8_t* pFrame;
+
+		auto beginTime = std::chrono::high_resolution_clock::now();
+		cv::Mat show;
+		do
 		{
-			cudaError_t cudaStatus;
-			if (pHwRgb == nullptr)
+			demuxer.Demux(&pVideo, &nVideoBytes);
+			nFrameReturned = dec.Decode(pVideo, nVideoBytes);
+			if (!nFrame && nFrameReturned)
 			{
-				cudaStatus = cudaMalloc((void**)&pHwRgb, 3 * frame->width * frame->height * sizeof(unsigned char));
-				cudaStatus = cudaMalloc((void**)&pHwDstRgb, 3 * dstWith * dstHeight * sizeof(unsigned char));
-				cudaStatus = cudaMalloc((void**)&pSrcInt32Data, frame->width * frame->height * sizeof(uint32));
-				cudaStatus = cudaMalloc((void**)&pDstInt32Data, dstWith * dstHeight * sizeof(uint32));
-				cudaStatus = cudaMalloc((void**)&dstyuvData, dstWith * dstHeight * sizeof(unsigned char) * 1.5);
+				LOG(INFO) << dec.GetVideoInfo();
+				// Get output frame size from decoder
+				nWidth = dec.GetWidth(); nHeight = dec.GetHeight();
+				nFrameSize = eOutputFormat == native ? dec.GetFrameSize() : nWidth * nHeight * anSize[eOutputFormat];
+				std::unique_ptr<uint8_t[]> pTemp(new uint8_t[nFrameSize]);
+				pImage = std::move(pTemp);
+				cuMemAlloc(&pTmpImage, nWidth * nHeight * anSize[eOutputFormat]);
+				show = cv::Mat(cv::Size(dec.GetWidth(), dec.GetHeight()), CV_8UC4);
 			}
-			cudaStatus = cuda_common::CUDAToBGR((uint32*)frame->data[0], (uint32*)frame->data[1], frame->linesize[0],
-				frame->linesize[1], pHwRgb, frame->width, frame->height);
-			if (cudaStatus != cudaSuccess)
+
+			for (int i = 0; i < nFrameReturned; i++)
 			{
-				std::cout << "CUDAToBGR failed !!!" << std::endl;
-				return 0;
+				iMatrix = dec.GetVideoFormatInfo().video_signal_description.matrix_coefficients;
+				pFrame = dec.GetFrame();
+				Nv12ToColor32<BGRA32>(pFrame, dec.GetWidth(), (uint8_t*)pTmpImage, 4 * dec.GetWidth(), dec.GetWidth(), dec.GetHeight(), iMatrix);
+				GetImage(pTmpImage, show.data, 4 * dec.GetWidth(), dec.GetHeight());
+				cv::imshow("frame", show);
+				cv::waitKey(1);
 			}
-			cuda_common::convertInt32(pHwRgb, pSrcInt32Data, frame->width, frame->height);
-			cuda_common::resize(pSrcInt32Data, pDstInt32Data, frame->width, frame->height, dstWith, dstHeight);
-			cuda_common::convertInt32toRgb(pDstInt32Data, pHwDstRgb, dstWith, dstHeight);
-			cuda_common::rgb2yuv420p(pHwDstRgb, dstyuvData, dstWith, dstHeight);
-
-			cudaMemcpy(outputFrame->data[0], dstyuvData, 1.5 * dstWith * dstHeight * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-
-			//cv::Mat rgbMat(cv::Size(dstWith ,dstHeight),CV_8UC3);
-			//cudaMemcpy(rgbMat.data, pHwDstRgb, 3 * dstWith * dstHeight * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-			//cv::imshow("ori", rgbMat);
-			//cv::waitKey(1);
-
-			//cv::Mat resizedMat(dstHeight + dstHeight / 2, dstWith, CV_8UC1);
-			//cudaMemcpy(resizedMat.data, dstyuvData, 1.5 * dstWith * dstHeight * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-			//cv::imshow("out", resizedMat);
-			//printf("%d %d\n", resizedMat.cols, resizedMat.rows);
-			//cv::Mat rgbDst;
-			//cv::cvtColor(resizedMat, rgbDst, cv::COLOR_YUV420p2BGR,3);
-			//cv::imshow("out", rgbDst);
-			//cv::waitKey(1);
-			//cudaStatus = cudaMemcpy(frameMat.data, pHwRgb, 3 * frame->width * frame->height * sizeof(unsigned char), cudaMemcpyDeviceToHost);
-			/* retrieve data from GPU to CPU */
-			//if ((ret = av_hwframe_transfer_data(sw_frame, frame, 0)) < 0)
-			//{
-			//	fprintf(stderr, "Error transferring the data to system memory\n");
-			//	goto fail;
-			//}
-			//tmp_frame = sw_frame;
+			nFrame += nFrameReturned;
+			printf("%d\n", nFrame);
 		}
-		else
+		while (nVideoBytes);
+		auto endTime = std::chrono::high_resolution_clock::now();
+		auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - beginTime);
+		std::cout << elapsedTime.count() << std::endl;
+
+		if (pTmpImage)
 		{
-			//tmp_frame = frame;
+			cuMemFree(pTmpImage);
 		}
 
-		//printf("tmp frame fmt ; %s\n", av_get_pix_fmt_name((AVPixelFormat)tmp_frame->format));
-
-		{
-			auto endTime = std::chrono::high_resolution_clock::now();
-			auto elapsedTime = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
-			std::cout << "create Elapsed time: " << elapsedTime.count() << "mis\n";
-		}
-
-	fail:
-		av_frame_free(&frame);
-		av_frame_free(&sw_frame);
-		av_freep(&buffer);
-		if (ret < 0)
-			return ret;
+		std::cout << "Total frame decoded: " << nFrame << std::endl << "Saved in file " << szOutFilePath << std::endl;
+		fpOut.close();
 	}
-}
-
-int main(int argc, char* argv[])
-{
-	cuda_common::setColorSpace2(0);
-
-
-	uint8_t endcode[] = { 0, 0, 1, 0xb7 };
-	outputFile = "output.mp4";
-	codecName = "h264_nvenc";
-	encoderCodec = avcodec_find_encoder_by_name(codecName);
-	if (!encoderCodec)
+	catch (const std::exception& ex)
 	{
-		fprintf(stderr, "Codec '%s' not found\n", codecName);
+		std::cout << ex.what();
 		exit(1);
 	}
-	encoderCtx = avcodec_alloc_context3(encoderCodec);
-
-	if (!encoderCtx)
-	{
-		fprintf(stderr, "Could not allocate video codec context\n");
-		exit(1);
-	}
-
-	encoderPkt = av_packet_alloc();
-	if (!encoderPkt)
-		exit(1);
-	encoderCtx->bit_rate = 400000;
-	encoderCtx->width = dstWith;
-	encoderCtx->height = dstHeight;
-	encoderCtx->time_base = { 1,25 };
-	encoderCtx->framerate = { 25,1 };
-	encoderCtx->gop_size = 10;
-	encoderCtx->max_b_frames = 1;
-	encoderCtx->pix_fmt = AV_PIX_FMT_YUV420P;
-
-	if (encoderCodec->id == AV_CODEC_ID_H264)
-		av_opt_set(encoderCtx->priv_data, "preset", "slow", 0);
-
-	/* open it */
-	ret = avcodec_open2(encoderCtx, encoderCodec, NULL);
-	if (ret < 0)
-	{
-		fprintf(stderr, "Could not open codec: %d\n", ret);
-		exit(1);
-	}
-
-	f = fopen(outputFile, "wb");
-
-	outputFrame = av_frame_alloc();
-	outputFrame->format = AV_PIX_FMT_YUV420P;
-	outputFrame->width = dstWith;
-	outputFrame->height = dstHeight;
-
-	av_frame_get_buffer(outputFrame, 0);
-
-	AVFormatContext* input_ctx = NULL;
-	AVStream* video = NULL;
-	AVCodecContext* decoder_ctx = NULL;
-	const AVCodec* decoder = NULL;
-	AVPacket* packet = NULL;
-	enum AVHWDeviceType type;
-	int i;
-
-	type = av_hwdevice_find_type_by_name("cuda");
-	if (type == AV_HWDEVICE_TYPE_NONE)
-	{
-		fprintf(stderr, "Device type %s is not supported.\n", argv[1]);
-		fprintf(stderr, "Available device types:");
-		while ((type = av_hwdevice_iterate_types(type)) != AV_HWDEVICE_TYPE_NONE)
-			fprintf(stderr, " %s", av_hwdevice_get_type_name(type));
-		fprintf(stderr, "\n");
-		return -1;
-	}
-
-	packet = av_packet_alloc();
-	if (!packet)
-	{
-		fprintf(stderr, "Failed to allocate AVPacket\n");
-		return -1;
-	}
-
-	/* open the input file */
-	if (avformat_open_input(&input_ctx, "input.mp4", NULL, NULL) != 0)
-	{
-		fprintf(stderr, "Cannot open input file '%s'\n", argv[2]);
-		return -1;
-	}
-
-	if (avformat_find_stream_info(input_ctx, NULL) < 0)
-	{
-		fprintf(stderr, "Cannot find input stream information.\n");
-		return -1;
-	}
-
-	/* find the video stream information */
-	ret = av_find_best_stream(input_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, &decoder, 0);
-	if (ret < 0)
-	{
-		fprintf(stderr, "Cannot find a video stream in the input file\n");
-		return -1;
-	}
-	video_stream = ret;
-
-	for (i = 0;; i++)
-	{
-		const AVCodecHWConfig* config = avcodec_get_hw_config(decoder, i);
-		if (!config)
-		{
-			fprintf(stderr,
-				"Decoder %s does not support device type %s.\n",
-				decoder->name,
-				av_hwdevice_get_type_name(type));
-			return -1;
-		}
-		if (config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX && config->device_type == type)
-		{
-			hw_pix_fmt = config->pix_fmt;
-			break;
-		}
-	}
-
-	if (!(decoder_ctx = avcodec_alloc_context3(decoder)))
-		return AVERROR(ENOMEM);
-
-	video = input_ctx->streams[video_stream];
-	if (avcodec_parameters_to_context(decoder_ctx, video->codecpar) < 0)
-		return -1;
-
-	decoder_ctx->get_format = get_hw_format;
-
-	if (hw_decoder_init(decoder_ctx, type) < 0)
-		return -1;
-
-	if ((ret = avcodec_open2(decoder_ctx, decoder, NULL)) < 0)
-	{
-		fprintf(stderr, "Failed to open codec for stream #%u\n", video_stream);
-		return -1;
-	}
-
-	/* open the file to dump raw data */
-	output_file = fopen("output", "w+b");
-
-	/* actual decoding and dump the raw data */
-	auto beginTime = std::chrono::high_resolution_clock::now();
-	int fps = 0;
-	while (ret >= 0)
-	{
-		++fps;
-		if ((ret = av_read_frame(input_ctx, packet)) < 0)
-			break;
-
-		if (video_stream == packet->stream_index)
-			ret = decode_write(decoder_ctx, packet);
-
-		av_packet_unref(packet);
-
-		{
-			auto endTime = std::chrono::high_resolution_clock::now();
-			auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime
-				- beginTime);
-			int sendTime = elapsedTime.count();
-			if (sendTime >= 1000)
-			{
-				printf("fps = %d\n", fps);
-				beginTime = endTime;
-				fps = 0;
-			}
-		}
-	}
-
-	/* flush the decoder */
-	ret = decode_write(decoder_ctx, NULL);
-
-	if (output_file)
-		fclose(output_file);
-	av_packet_free(&packet);
-	avcodec_free_context(&decoder_ctx);
-	avformat_close_input(&input_ctx);
-	av_buffer_unref(&hw_device_ctx);
-
 	return 0;
 }
+

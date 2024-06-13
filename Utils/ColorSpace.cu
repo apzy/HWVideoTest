@@ -26,6 +26,7 @@
  */
 
 #include "ColorSpace.h"
+#include <stdio.h>
 
 __constant__ float matYuv2Rgb[3][3];
 __constant__ float matRgb2Yuv[3][3];
