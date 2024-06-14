@@ -95,6 +95,10 @@ int main(int argc, char** argv)
 		createCudaContext(&cuContext, iGpu, 0);
 
 		FFmpegDemuxer demuxer(szInFilePath);
+		Dim resizeDim;
+		resizeDim.w = 640;
+		resizeDim.h = 480;
+		//NvDecoder dec(cuContext, true, FFmpeg2NvCodecId(demuxer.GetVideoCodec()),false,false,NULL,&resizeDim);
 		NvDecoder dec(cuContext, true, FFmpeg2NvCodecId(demuxer.GetVideoCodec()));
 		int nWidth = 0, nHeight = 0, nFrameSize = 0;
 		int anSize[] = { 0, 3, 3, 4, 4, 8, 8 };
@@ -113,7 +117,6 @@ int main(int argc, char** argv)
 			if (!nFrame && nFrameReturned)
 			{
 				LOG(INFO) << dec.GetVideoInfo();
-				// Get output frame size from decoder
 				nWidth = dec.GetWidth(); nHeight = dec.GetHeight();
 				nFrameSize = eOutputFormat == native ? dec.GetFrameSize() : nWidth * nHeight * anSize[eOutputFormat];
 				std::unique_ptr<uint8_t[]> pTemp(new uint8_t[nFrameSize]);
