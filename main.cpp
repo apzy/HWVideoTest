@@ -1,26 +1,25 @@
-#include <chrono>
-#include <opencv2/opencv.hpp>
+#include <cuda_runtime.h>
 #include <stdio.h>
-#include "convert.cuh"
-#include <cuda.h>
 #include <iostream>
+#include <thread>
 #include <algorithm>
+#include <chrono>
+#include <mutex>
+#include <string.h>
 #include <memory>
+#include <opencv2/opencv.hpp>
 #include "NvCodec/NvDecoder/NvDecoder.h"
 #include "Utils/FFmpegDemuxer.h"
 #include "Utils/ColorSpace.h"
 #include "Common/AppDecUtils.h"
 #include <chrono>
+#include "NvCodec/NvEncoder/NvEncoderCuda.h"
+#include "Utils/NvEncoderCLIOptions.h"
+
+using NvEncCudaPtr = std::unique_ptr<NvEncoderCuda, std::function<void(NvEncoderCuda*)>>;
 
 simplelogger::Logger* logger = simplelogger::LoggerFactory::CreateConsoleLogger();
 
-/**
-*   @brief  Function to copy image data from CUDA device pointer to host buffer
-*   @param  dpSrc   - CUDA device pointer which holds decoded raw frame
-*   @param  pDst    - Pointer to host buffer which acts as the destination for the copy
-*   @param  nWidth  - Width of decoded frame
-*   @param  nHeight - Height of decoded frame
-*/
 void GetImage(CUdeviceptr dpSrc, uint8_t* pDst, int nWidth, int nHeight)
 {
 	CUDA_MEMCPY2D m = { 0 };
@@ -35,120 +34,103 @@ void GetImage(CUdeviceptr dpSrc, uint8_t* pDst, int nWidth, int nHeight)
 	cuMemcpy2D(&m);
 }
 
-enum OutputFormat
+int FindMin(volatile int* a, int n)
 {
-	native = 0, bgrp, rgbp, bgra, rgba, bgra64, rgba64
-};
-
-std::vector<std::string> vstrOutputFormatName =
-{
-	"native", "bgrp", "rgbp", "bgra", "rgba", "bgra64", "rgba64"
-};
-
-std::string GetSupportedFormats()
-{
-	std::ostringstream oss;
-	for (auto& v : vstrOutputFormatName)
+	int r = INT_MAX;
+	for (int i = 0; i < n; i++)
 	{
-		oss << " " << v;
+		if (a[i] < r)
+		{
+			r = a[i];
+		}
 	}
-
-	return oss.str();
+	return r;
 }
 
-int main(int argc, char** argv)
+void TranscodeOneToN(NvDecoder* pDec, FFmpegDemuxer* pDemuxer, const char* szOutFileNamePrefix)
 {
-	char szInFilePath[256] = "input.mp4", szOutFilePath[256] = "output.mp4";
-	OutputFormat eOutputFormat = bgra;
-	int iGpu = 0;
-	bool bReturn = 1;
-	CUdeviceptr pTmpImage = 0;
+	const int nSrcFrame = 8;
 
+	volatile bool bEnd = false;
+	volatile int iDec = 0;
+
+	uint8_t* apSrcFrame[nSrcFrame] = { 0 };
+
+	std::vector<NvThread> vpth;
+	int nVideoBytes = 0, nFrameReturned = 0, nFrame = 0;
+	uint8_t* pVideo = NULL, * pFrame = NULL;
+
+	// aiEnc[i] holds the next frame to be encoded by encoder instance i.
+	int nWidth, nHeight;
+	CUdeviceptr pTmpImage = 0;
+	cuMemAlloc(&pTmpImage, 1920 * 1080 * 4);
+
+	uint8_t* dstFrame;
+	int dstWidth = 640;
+	int dstHeight = 480;
+	size_t dstPitch = 0;
+
+	cuMemAllocPitch((CUdeviceptr*)&dstFrame, &dstPitch, dstWidth, dstHeight + (dstHeight / 2), 16);
+	cv::Mat show(cv::Size(dstWidth, dstHeight), CV_8UC4);
+	do
+	{
+		pDemuxer->Demux(&pVideo, &nVideoBytes);
+		nFrameReturned = pDec->Decode(pVideo, nVideoBytes);
+
+		for (int i = 0; i < nFrameReturned; i++)
+		{
+			pFrame = pDec->GetFrame();
+			int iMatrix = pDec->GetVideoFormatInfo().video_signal_description.matrix_coefficients;
+			printf("%d %d %d\n", pDec->GetDeviceFramePitch(), pDemuxer->GetWidth(), pDemuxer->GetHeight());
+
+			ResizeNv12(dstFrame, dstPitch, dstWidth, dstHeight, pFrame, pDec->GetDeviceFramePitch(), pDemuxer->GetWidth(), pDemuxer->GetHeight());
+			Nv12ToColor32<BGRA32>(dstFrame, dstPitch, (uint8_t*)pTmpImage, 4 * dstWidth,
+				dstWidth, dstHeight, iMatrix);
+			GetImage(pTmpImage, show.data, 4 * dstWidth, dstHeight);
+			cv::imshow("frame", show);
+			cv::waitKey(0);
+		}
+
+	}
+	while (nVideoBytes);
+
+	bEnd = true;
+	for (auto& pth : vpth)
+	{
+		pth.join();
+	}
+	for (int i = 0; i < nSrcFrame; i++)
+	{
+		if (apSrcFrame[i])
+		{
+			pDec->UnlockFrame(&apSrcFrame[i]);
+		}
+	}
+
+}
+
+int main(int argc, char* argv[])
+{
+	int iGpu = 0;
+	char szInFilePath[260] = "input.mp4";
+	char szOutFileNamePrefix[260] = "out";
+	std::vector<int2> vResolution;
+	vResolution.push_back(make_int2(600, 480));
+	std::vector<std::exception_ptr> vExceptionPtrs;
 	try
 	{
 		CheckInputFile(szInFilePath);
 
-		if (!*szOutFilePath)
-		{
-			sprintf(szOutFilePath, "out.%s", vstrOutputFormatName[eOutputFormat].c_str());
-		}
-
-		std::ofstream fpOut(szOutFilePath, std::ios::out | std::ios::binary);
-		if (!fpOut)
-		{
-			std::ostringstream err;
-			err << "Unable to open output file: " << szOutFilePath << std::endl;
-			throw std::invalid_argument(err.str());
-		}
-
-		ck(cuInit(0));
-		int nGpu = 0;
-		ck(cuDeviceGetCount(&nGpu));
-		if (iGpu < 0 || iGpu >= nGpu)
-		{
-			std::ostringstream err;
-			err << "GPU ordinal out of range. Should be within [" << 0 << ", " << nGpu - 1 << "]";
-			throw std::invalid_argument(err.str());
-		}
-
+		CUdevice cuDevice = 0;
 		CUcontext cuContext = NULL;
-		createCudaContext(&cuContext, iGpu, 0);
+		ck(cuInit(0));
+		ck(cuDeviceGet(&cuDevice, iGpu));
+		ck(cuCtxCreate(&cuContext, 0, cuDevice));
 
 		FFmpegDemuxer demuxer(szInFilePath);
-		Dim resizeDim;
-		resizeDim.w = 640;
-		resizeDim.h = 480;
-		//NvDecoder dec(cuContext, true, FFmpeg2NvCodecId(demuxer.GetVideoCodec()),false,false,NULL,&resizeDim);
-		NvDecoder dec(cuContext, true, FFmpeg2NvCodecId(demuxer.GetVideoCodec()));
-		int nWidth = 0, nHeight = 0, nFrameSize = 0;
-		int anSize[] = { 0, 3, 3, 4, 4, 8, 8 };
-		std::unique_ptr<uint8_t[]> pImage;
+		NvDecoder dec(cuContext, true, FFmpeg2NvCodecId(demuxer.GetVideoCodec()), false, true);
+		TranscodeOneToN(&dec, &demuxer, szOutFileNamePrefix);
 
-		int nVideoBytes = 0, nFrameReturned = 0, nFrame = 0, iMatrix = 0;
-		uint8_t* pVideo = nullptr;
-		uint8_t* pFrame;
-
-		auto beginTime = std::chrono::high_resolution_clock::now();
-		cv::Mat show;
-		do
-		{
-			demuxer.Demux(&pVideo, &nVideoBytes);
-			nFrameReturned = dec.Decode(pVideo, nVideoBytes);
-			if (!nFrame && nFrameReturned)
-			{
-				LOG(INFO) << dec.GetVideoInfo();
-				nWidth = dec.GetWidth(); nHeight = dec.GetHeight();
-				nFrameSize = eOutputFormat == native ? dec.GetFrameSize() : nWidth * nHeight * anSize[eOutputFormat];
-				std::unique_ptr<uint8_t[]> pTemp(new uint8_t[nFrameSize]);
-				pImage = std::move(pTemp);
-				cuMemAlloc(&pTmpImage, nWidth * nHeight * anSize[eOutputFormat]);
-				show = cv::Mat(cv::Size(dec.GetWidth(), dec.GetHeight()), CV_8UC4);
-			}
-
-			for (int i = 0; i < nFrameReturned; i++)
-			{
-				iMatrix = dec.GetVideoFormatInfo().video_signal_description.matrix_coefficients;
-				pFrame = dec.GetFrame();
-				Nv12ToColor32<BGRA32>(pFrame, dec.GetWidth(), (uint8_t*)pTmpImage, 4 * dec.GetWidth(), dec.GetWidth(), dec.GetHeight(), iMatrix);
-				GetImage(pTmpImage, show.data, 4 * dec.GetWidth(), dec.GetHeight());
-				cv::imshow("frame", show);
-				cv::waitKey(1);
-			}
-			nFrame += nFrameReturned;
-			printf("%d\n", nFrame);
-		}
-		while (nVideoBytes);
-		auto endTime = std::chrono::high_resolution_clock::now();
-		auto elapsedTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - beginTime);
-		std::cout << elapsedTime.count() << std::endl;
-
-		if (pTmpImage)
-		{
-			cuMemFree(pTmpImage);
-		}
-
-		std::cout << "Total frame decoded: " << nFrame << std::endl << "Saved in file " << szOutFilePath << std::endl;
-		fpOut.close();
 	}
 	catch (const std::exception& ex)
 	{

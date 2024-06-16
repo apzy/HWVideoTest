@@ -35,7 +35,7 @@
 #include <iostream>
 #include <sstream>
 #include <string.h>
-#include "NvCodecUtils.h"
+#include "../../Utils/NvCodecUtils.h"
 
 /**
 * @brief Exception class for error reporting from NvEncodeAPI calls.
