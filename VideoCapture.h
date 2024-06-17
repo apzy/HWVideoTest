@@ -42,4 +42,6 @@ private:
 
 	uint8_t* m_video;
 	int m_videoBytes;
+
+	int m_frameSize;
 };

@@ -9,7 +9,9 @@ VideoCapture::VideoCapture(const std::string& filePath)
 	ck(cuDeviceGet(&m_cuDevice, 0));
 	ck(cuCtxCreate(&m_cuContext, 0, m_cuDevice));
 	m_demuxer = new FFmpegDemuxer(m_filePath.c_str());
+	Rect cropRect = { 0, 100, 100, 200 };
 	m_decoder = new NvDecoder(m_cuContext, true, FFmpeg2NvCodecId(m_demuxer->GetVideoCodec()), false, true);
+	m_frameSize = 0;
 	get_frame();
 }
 
@@ -59,10 +61,13 @@ void VideoCapture::get_frame()
 			break;
 		for (int i = 0; i < frameReturned; ++i)
 		{
-			int frameSize = m_decoder->GetDeviceFramePitch() *  m_decoder->GetHeight() * 1.5;
+			if (m_frameSize == 0)
+			{
+				m_frameSize = m_decoder->GetDeviceFramePitch() * m_decoder->GetHeight() * 1.5;
+			}
 			uint8_t* frame = NULL;
-			cuMemAlloc((CUdeviceptr*)&frame, frameSize);
-			cuMemcpy((CUdeviceptr)frame, (CUdeviceptr)m_decoder->GetFrame(), frameSize);
+			cuMemAlloc((CUdeviceptr*)&frame, m_frameSize);
+			cuMemcpy((CUdeviceptr)frame, (CUdeviceptr)m_decoder->GetFrame(), m_frameSize);
 			m_frames.push_back(frame);
 		}
 	}
