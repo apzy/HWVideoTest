@@ -18,7 +18,7 @@ add_executable(HWVideoTest "main.cpp"
 "Utils/Resize.cu"
 "VideoCapture.h"
 "VideoCapture.cpp"
-)
+ "VideoWriter.h" "VideoWriter.cpp")
 
 target_include_directories(HWVideoTest PUBLIC "E:/Video_Codec_SDK_12.2.72/Interface")
 target_include_directories(HWVideoTest PUBLIC "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8/include")

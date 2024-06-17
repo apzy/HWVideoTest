@@ -9,7 +9,6 @@ VideoCapture::VideoCapture(const std::string& filePath)
 	ck(cuDeviceGet(&m_cuDevice, 0));
 	ck(cuCtxCreate(&m_cuContext, 0, m_cuDevice));
 	m_demuxer = new FFmpegDemuxer(m_filePath.c_str());
-	Rect cropRect = { 0, 100, 100, 200 };
 	m_decoder = new NvDecoder(m_cuContext, true, FFmpeg2NvCodecId(m_demuxer->GetVideoCodec()), false, true);
 	m_frameSize = 0;
 	get_frame();
